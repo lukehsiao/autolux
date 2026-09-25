@@ -1,6 +1,6 @@
 {
   "name": "autolux",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "devDependencies": {
     "@changesets/changelog-github": "^1.0.0",
