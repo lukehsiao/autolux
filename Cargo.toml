@@ -1,0 +1,43 @@
+[package]
+name = "autolux"
+version = "0.0.0"
+edition = "2024"
+authors = ["Luke Hsiao <luke@hsiao.dev>"]
+description = "Adaptive backlight daemon driven by an ambient light sensor"
+repository = "https://github.com/lukehsiao/autolux"
+homepage = "https://github.com/lukehsiao/autolux"
+license = "BlueOak-1.0.0"
+keywords = ["backlight", "brightness", "ambient-light", "daemon", "linux"]
+categories = ["command-line-utilities"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# Strip symbols and maximize LTO to keep release binaries small. Fat LTO
+# makes release builds slower, but those only happen in CI and on
+# `cargo install`.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+clap-verbosity-flag = "3.0.4"
+miette = { version = "7.6.0", features = ["fancy"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+zbus = "5.19.0"
+
+[dev-dependencies]
+hegeltest = "0.47.3"
+tempfile = "3.27.0"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

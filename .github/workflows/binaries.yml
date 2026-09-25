@@ -1,0 +1,96 @@
+name: Binaries
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to attach binaries to (e.g. v0.5.4)"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach binaries to (e.g. v0.5.4)"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use-cross: false
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            use-cross: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use-cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            use-cross: true
+          - target: armv7-unknown-linux-gnueabihf
+            runner: ubuntu-latest
+            use-cross: true
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            use-cross: true
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cross
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ matrix.use-cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Create archive
+        shell: bash
+        run: |
+          mkdir stage
+          cp target/${{ matrix.target }}/release/autolux LICENSE.md README.md stage/
+          tar czf autolux-${{ matrix.target }}.tar.gz \
+            -C stage autolux LICENSE.md README.md
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          sha256sum autolux-${{ matrix.target }}.tar.gz > autolux-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release upload "$TAG" \
+            autolux-${{ matrix.target }}.tar.gz \
+            autolux-${{ matrix.target }}.tar.gz.sha256 \
+            --clobber
