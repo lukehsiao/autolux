@@ -178,10 +178,6 @@ fn read_number(fs: &FileSystem, path: &Path) -> Result<f64> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::float_cmp,
-    reason = "the expected values are exact in binary floating point"
-)]
 mod tests {
     use std::path::Path;
 

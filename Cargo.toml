@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 zbus = "5.19.0"
 
 [dev-dependencies]
-hegeltest = "0.47.3"
+hegeltest = "0.48.1"
 tempfile = "3.27.0"
 
 [package.metadata.binstall]

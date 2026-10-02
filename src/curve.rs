@@ -404,7 +404,6 @@ pub(crate) mod tests {
     // The perceptual scale runs from exactly 0 (off) to exactly 1 (the
     // panel's maximum), whatever that maximum is.
     #[hegel::test]
-    #[expect(clippy::float_cmp, reason = "cbrt(0) and cbrt(1) are exact")]
     fn perceived_spans_zero_to_one(tc: TestCase) {
         let curve = tc.draw(curves());
         assert_eq!(curve.perceived(0), 0.0);
