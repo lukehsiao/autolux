@@ -42,15 +42,30 @@ pub enum Error {
         contents: String,
         expected: &'static str,
     },
-    #[error("logind refused to set the backlight: {reason}")]
+    #[error("cannot reach the system bus")]
     #[diagnostic(
-        code(autolux::logind_error),
+        code(autolux::bus_error),
+        help(
+            "autolux sets the backlight through systemd-logind on the system bus. Check that the \
+             system bus is running (systemctl status dbus.socket)."
+        )
+    )]
+    Bus {
+        #[source]
+        source: zbus::Error,
+    },
+    #[error("logind refused to set the backlight: {detail}")]
+    #[diagnostic(
+        code(autolux::not_permitted),
         help(
             "SetBrightness only works for the owner of a seated session. Run autolux as a systemd \
              user service or from a terminal inside the graphical session, not over SSH."
         )
     )]
-    Logind { reason: String },
+    NotPermitted { detail: String },
+    #[error("logind failed to set the backlight: {name}: {detail}")]
+    #[diagnostic(code(autolux::logind_error))]
+    Logind { name: String, detail: String },
     #[error("the ambient light sensor has been unreadable for {outage:?}")]
     #[diagnostic(
         code(autolux::sensor_unavailable),

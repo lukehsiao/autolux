@@ -62,7 +62,7 @@ impl Backlight {
     /// # Errors
     /// [`Error::NoBacklight`] when there is none; [`Error::Read`] or
     /// [`Error::Parse`] when the chosen panel's `max_brightness` is unusable;
-    /// [`Error::Logind`] when the system bus is unreachable.
+    /// [`Error::Bus`] when the system bus is unreachable.
     pub fn detect() -> Result<Self> {
         Self::detect_in(Sysfs::create(), Logind::create())
     }
@@ -129,10 +129,11 @@ impl Backlight {
     /// Sets the panel to raw brightness `raw`.
     ///
     /// # Errors
-    /// [`Error::Logind`] when logind refuses.
+    /// [`Error::NotPermitted`], [`Error::Logind`] or [`Error::Bus`] when
+    /// the write fails.
     pub fn set(&self, raw: u32) -> Result<()> {
         self.writes.emit(|| raw);
-        self.logind.set_brightness("backlight", &self.name, raw)
+        self.logind.set_brightness(&self.name, raw)
     }
 }
 
@@ -185,7 +186,7 @@ mod tests {
     use super::{Backlight, NulledBacklight};
     use crate::{
         error::Error,
-        logind::{BrightnessRequest, Logind},
+        logind::{Logind, NulledLogind},
         sysfs::{NulledFile, Sysfs},
     };
 
@@ -275,39 +276,52 @@ mod tests {
     }
 
     #[test]
-    fn writes_go_to_logind_for_the_chosen_device() {
-        let logind = Logind::create_null();
-        let requests = logind.track_requests();
-        let backlight = detect(
-            &[(
-                "/sys/class/backlight/intel_backlight/max_brightness",
-                "7500\n",
-            )],
-            logind,
-        )
-        .unwrap();
+    fn writes_are_tracked() {
+        let backlight = Backlight::create_null();
         let writes = backlight.track_writes();
         backlight.set(4321).unwrap();
         assert_eq!(writes.data(), [4321]);
-        assert_eq!(
-            requests.data(),
-            [BrightnessRequest {
-                subsystem: "backlight".to_owned(),
-                name: "intel_backlight".to_owned(),
-                brightness: 4321,
-            }]
+    }
+
+    // logind finds the device by the name in the request, so a write must
+    // name the panel that detection chose, not any other panel.
+    #[test]
+    fn writes_name_the_chosen_panel() {
+        let panels = [
+            ("/sys/class/backlight/a_raw/type", "raw\n"),
+            ("/sys/class/backlight/a_raw/max_brightness", "10\n"),
+            ("/sys/class/backlight/c_firmware/type", "firmware\n"),
+            ("/sys/class/backlight/c_firmware/max_brightness", "30\n"),
+        ];
+        let finding = |panel: &str| {
+            Logind::create_null_with(NulledLogind {
+                panels: Some(vec![panel.to_owned()]),
+                ..NulledLogind::default()
+            })
+        };
+        detect(&panels, finding("c_firmware"))
+            .unwrap()
+            .set(5)
+            .unwrap();
+        let err = detect(&panels, finding("a_raw"))
+            .unwrap()
+            .set(5)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Logind { name, .. } if name == "System.Error.ENODEV"),
+            "{err:?}"
         );
     }
 
     #[test]
-    fn refused_writes_are_logind_errors() {
+    fn refused_writes_are_not_permitted() {
         let backlight = Backlight::create_null_with(NulledBacklight {
             refusal: Some("no seat".to_owned()),
             ..NulledBacklight::default()
         });
         let err = backlight.set(1).unwrap_err();
         assert!(
-            matches!(&err, Error::Logind { reason } if reason == "no seat"),
+            matches!(&err, Error::NotPermitted { detail } if detail == "no seat"),
             "{err:?}"
         );
     }

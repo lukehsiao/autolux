@@ -344,7 +344,7 @@ mod tests {
         .unwrap();
         harness.controller.step().unwrap();
         let err = harness.controller.step().unwrap_err();
-        assert!(matches!(err, Error::Logind { .. }), "{err:?}");
+        assert!(matches!(err, Error::NotPermitted { .. }), "{err:?}");
         assert_eq!(
             harness.writes.data().len(),
             1,
