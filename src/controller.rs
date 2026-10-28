@@ -367,9 +367,25 @@ impl Running {
     }
 }
 
+/// The write quantum: the smallest change in lightness a fade writes.
+///
+/// Each write costs logind a D-Bus round trip, so a fade skips the frames
+/// that move the panel less than this. A fifth of the deadband is still far
+/// below one just-noticeable difference, so the steps stay invisible.
+const WRITE_QUANTUM: f64 = 0.002;
+
 /// The write policy: whether `frame`, run on `before`, changes the panel.
+///
+/// A frame that lands writes the target exactly, if the panel is not there
+/// yet. Any other frame writes only once the panel has moved at least
+/// [`WRITE_QUANTUM`] in lightness since the last write.
 fn writes(before: &Smoother, frame: Frame) -> bool {
-    frame.raw != before.written()
+    let written = before.written();
+    if frame.landed {
+        return frame.raw != written;
+    }
+    let curve = before.curve();
+    (curve.perceived(frame.raw) - curve.perceived(written)).abs() >= WRITE_QUANTUM
 }
 
 /// Logs an unreadable sample, unless the sensor has been unreadable since
@@ -418,6 +434,7 @@ mod tests {
 
     use super::{
         Controller, FRAME, Fatal, Input, MAX_SENSOR_OUTAGE, Output, SETTLED_SAMPLE_INTERVAL,
+        WRITE_QUANTUM,
         smoother::{DEADBAND, TAU_FADE},
     };
     use crate::curve::{
@@ -710,9 +727,9 @@ mod tests {
     }
 
     // No write visibly jumps: between consecutive writes the panel moves by
-    // at most one frame's worth of easing across the full scale, plus the
-    // width of one raw step, which is all rounding can add. Writes are at
-    // least a frame apart, however long each one takes.
+    // at most the write quantum plus one frame's worth of easing across the
+    // full scale, plus the width of one raw step, which is all rounding can
+    // add. Writes are at least a frame apart, however long each one takes.
     #[hegel::test]
     fn each_write_moves_the_panel_a_little(tc: TestCase) {
         let (mut world, _) = steady(&tc);
@@ -720,7 +737,7 @@ mod tests {
         world.latency = Duration::from_micros(tc.draw(generators::integers().max_value(50_000)));
         let (curve, start) = (world.curve, world.panel);
         let run = simulate(&world, Duration::from_secs(30));
-        let bound = one_frame_of_easing();
+        let bound = WRITE_QUANTUM + one_frame_of_easing();
         let writes: Vec<_> = run
             .seen
             .iter()
@@ -738,6 +755,29 @@ mod tests {
         }
         for pair in writes.windows(2) {
             assert!(pair[1].0.abs_diff(pair[0].0) >= FRAME, "{pair:?}");
+        }
+    }
+
+    // A fade writes only once the panel has moved by at least the write
+    // quantum since the last write. In steady light the target is fixed, so
+    // only the last write lands, and only it may move less.
+    #[hegel::test]
+    fn writes_are_at_least_a_quantum_apart(tc: TestCase) {
+        let (world, _) = steady(&tc);
+        let (curve, start) = (world.curve, world.panel);
+        let run = simulate(&world, LONGEST_FADE);
+        let writes = run.writes();
+        let Some((_, before_landing)) = writes.split_last() else {
+            return;
+        };
+        let mut previous = start;
+        for &raw in before_landing {
+            let moved = (curve.perceived(raw) - curve.perceived(previous)).abs();
+            assert!(
+                moved >= WRITE_QUANTUM,
+                "{previous} to {raw} moved {moved}, less than {WRITE_QUANTUM}"
+            );
+            previous = raw;
         }
     }
 

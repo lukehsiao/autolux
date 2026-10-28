@@ -119,7 +119,10 @@ The first smooths the light level with a 2 s time constant, so a passing shadow 
 The second eases the panel toward the curve's target with a 1 s time constant, on a perceptual scale (CIE lightness goes roughly as the cube root of luminance), so equal steps look equally large at any brightness.
 Chained, they change brightness with continuous speed: a fade starts gently, runs, and slows to a stop.
 
-While fading, the panel is updated at 60 Hz, and no single frame moves it by more than about 1.7% of the perceptual scale.
+While fading, the panel's lightness advances at 60 Hz, and no single frame moves it by more than about 1.7% of the lightness scale.
+Each write goes through logind over D-Bus, which costs CPU, so a fade writes only once the panel's lightness has moved by at least the write quantum, 0.2% of the scale, since the last write.
+That is far below a just-noticeable difference, and `autolux` sleeps through the frames in between.
+The write that ends a fade always lands exactly on the target.
 A fade across the whole range takes about five seconds.
 
 ### Staying out of the way
