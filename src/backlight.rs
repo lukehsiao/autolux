@@ -1,27 +1,26 @@
 //! The panel's backlight: read through sysfs, written through logind.
 
 use std::{
-    io,
     num::NonZeroU32,
     path::{Path, PathBuf},
 };
 
 use crate::{
     error::{Error, Result},
-    filesystem::FileSystem,
     logind::Logind,
     nullable::OutputListener,
+    sysfs::Sysfs,
 };
 #[cfg(test)]
 use crate::{
-    filesystem::NulledFile,
     nullable::{ConfigurableResponses, OutputTracker},
+    sysfs::NulledFile,
 };
 
 const BACKLIGHTS: &str = "/sys/class/backlight";
 
 pub struct Backlight {
-    fs: FileSystem,
+    fs: Sysfs,
     logind: Logind,
     dir: PathBuf,
     name: String,
@@ -65,31 +64,25 @@ impl Backlight {
     /// [`Error::Parse`] when the chosen panel's `max_brightness` is unusable;
     /// [`Error::Logind`] when the system bus is unreachable.
     pub fn detect() -> Result<Self> {
-        Self::detect_in(FileSystem::create(), Logind::create())
+        Self::detect_in(Sysfs::create(), Logind::create())
     }
 
-    fn detect_in(fs: FileSystem, logind: Logind) -> Result<Self> {
+    fn detect_in(fs: Sysfs, logind: Logind) -> Result<Self> {
         let root = Path::new(BACKLIGHTS);
-        let devices = match fs.read_dir(root) {
-            Ok(devices) => devices,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(source) => {
-                return Err(Error::Read {
-                    path: root.to_owned(),
-                    source,
-                });
-            }
-        };
         let preference = |dir: &PathBuf| {
-            let kind = fs.read_to_string(&dir.join("type")).unwrap_or_default();
-            match kind.trim() {
+            // A missing or odd `type` only lowers the panel's rank.
+            let kind: String = fs
+                .read(&dir.join("type"), "a backlight type")
+                .unwrap_or_default();
+            match kind.as_str() {
                 "firmware" => 0,
                 "platform" => 1,
                 "raw" => 2,
                 _ => 3,
             }
         };
-        let Some(dir) = devices
+        let Some(dir) = fs
+            .devices(root)?
             .into_iter()
             .min_by_key(|dir| (preference(dir), dir.clone()))
         else {
@@ -97,13 +90,7 @@ impl Backlight {
                 dir: root.to_owned(),
             });
         };
-        let max_path = dir.join("max_brightness");
-        let max = read_whole_number(&fs, &max_path)?;
-        let max = NonZeroU32::new(max).ok_or_else(|| Error::Parse {
-            path: max_path,
-            contents: "0\n".to_owned(),
-            expected: "a positive whole number",
-        })?;
+        let max = fs.read(&dir.join("max_brightness"), "a positive whole number")?;
         let name = dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -136,7 +123,7 @@ impl Backlight {
     /// # Errors
     /// [`Error::Read`] or [`Error::Parse`].
     pub fn brightness(&self) -> Result<u32> {
-        read_whole_number(&self.fs, &self.dir.join("brightness"))
+        self.fs.read(&self.dir.join("brightness"), "a whole number")
     }
 
     /// Sets the panel to raw brightness `raw`.
@@ -168,7 +155,7 @@ impl Backlight {
             refusal,
         } = panel;
         let dir = format!("{BACKLIGHTS}/intel_backlight");
-        let fs = FileSystem::create_null_with([
+        let fs = Sysfs::create_null_with([
             (format!("{dir}/type"), NulledFile::from("raw\n")),
             (
                 format!("{dir}/max_brightness"),
@@ -191,18 +178,6 @@ impl Backlight {
     }
 }
 
-fn read_whole_number(fs: &FileSystem, path: &Path) -> Result<u32> {
-    let contents = fs.read_to_string(path).map_err(|source| Error::Read {
-        path: path.to_owned(),
-        source,
-    })?;
-    contents.trim().parse().map_err(|_| Error::Parse {
-        path: path.to_owned(),
-        contents,
-        expected: "a whole number",
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -210,13 +185,13 @@ mod tests {
     use super::{Backlight, NulledBacklight};
     use crate::{
         error::Error,
-        filesystem::{FileSystem, NulledFile},
         logind::{BrightnessRequest, Logind},
+        sysfs::{NulledFile, Sysfs},
     };
 
     fn detect(files: &[(&str, &str)], logind: Logind) -> crate::error::Result<Backlight> {
         Backlight::detect_in(
-            FileSystem::create_null_with(
+            Sysfs::create_null_with(
                 files
                     .iter()
                     .map(|(path, contents)| (*path, NulledFile::from(*contents))),
@@ -276,8 +251,9 @@ mod tests {
         .err()
         .unwrap();
         assert!(
-            matches!(&err, Error::Parse { path, expected: "a positive whole number", .. }
-                if path == Path::new("/sys/class/backlight/broken/max_brightness")),
+            matches!(&err, Error::Parse { path, contents, expected: "a positive whole number" }
+                if path == Path::new("/sys/class/backlight/broken/max_brightness")
+                    && contents == "0\n"),
             "{err:?}"
         );
     }

@@ -4,11 +4,11 @@ mod clock;
 mod controller;
 mod curve;
 pub mod error;
-mod filesystem;
 mod logind;
 mod nullable;
 mod sensor;
 mod smoother;
+mod sysfs;
 
 use crate::{
     args::Args, backlight::Backlight, clock::Clock, controller::Controller, curve::Limits,

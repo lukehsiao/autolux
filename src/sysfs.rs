@@ -1,33 +1,71 @@
-//! Read-only view of the filesystem, which is how sysfs exposes sensors and
-//! panels. This is the lowest layer: [`FileSystem::create`] forwards to
-//! `std::fs`, and the nulled filesystem serves configured contents without
-//! touching the disk. Everything above it (detection, parsing, control) runs
-//! for real in both modes.
+//! Read-only view of sysfs, where the kernel exposes sensors and panels. This
+//! is the lowest layer: [`Sysfs::create`] forwards to `std::fs`, and the
+//! nulled sysfs serves configured contents without touching the disk. It
+//! owns reading attributes as typed values and mapping failures to
+//! [`Error::Read`] and [`Error::Parse`]. Everything above it (detection,
+//! control) runs for real in both modes.
 
 use std::{
     io,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
+use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::nullable::ConfigurableResponses;
 
-pub struct FileSystem {
+pub struct Sysfs {
     disk: Disk,
 }
 
-impl FileSystem {
+impl Sysfs {
     #[must_use]
     pub fn create() -> Self {
         Self { disk: Disk::Real }
     }
 
-    /// The whole file, exactly as stored; sysfs attributes end in a newline.
+    /// The attribute at `path` as a `T`, ignoring surrounding whitespace such
+    /// as the trailing newline sysfs adds. `expected` describes a valid value
+    /// for the error message, e.g. "a whole number".
     ///
     /// # Errors
-    /// Any I/O error, including `NotFound` for a missing attribute.
-    pub fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        self.disk.read_to_string(path)
+    /// [`Error::Read`] when the file is unreadable; [`Error::Parse`], with
+    /// the file's real contents, when it does not hold a `T`.
+    pub fn read<T: FromStr>(&self, path: &Path, expected: &'static str) -> Result<T> {
+        let contents = self
+            .disk
+            .read_to_string(path)
+            .map_err(|source| Error::Read {
+                path: path.to_owned(),
+                source,
+            })?;
+        contents.trim().parse().map_err(|_| Error::Parse {
+            path: path.to_owned(),
+            contents,
+            expected,
+        })
+    }
+
+    /// The devices under a class directory such as `/sys/class/backlight`,
+    /// as full paths in name order. A missing directory means the kernel
+    /// has no driver for the class loaded, so it holds no devices.
+    ///
+    /// # Errors
+    /// [`Error::Read`] for any I/O error other than `NotFound`.
+    pub fn devices(&self, class: &Path) -> Result<Vec<PathBuf>> {
+        let mut devices = match self.disk.read_dir(class) {
+            Ok(devices) => devices,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(source) => {
+                return Err(Error::Read {
+                    path: class.to_owned(),
+                    source,
+                });
+            }
+        };
+        devices.sort();
+        Ok(devices)
     }
 
     /// Full paths of the direct children of `path`, in no particular order.
@@ -40,7 +78,7 @@ impl FileSystem {
 }
 
 #[cfg(test)]
-impl FileSystem {
+impl Sysfs {
     /// A filesystem containing exactly `files`, plus the directories above
     /// them. Reading anything else fails with [`io::ErrorKind::NotFound`],
     /// as the real filesystem does for a missing sysfs attribute.
@@ -57,7 +95,7 @@ impl FileSystem {
     }
 }
 
-/// Contents of one file in a nulled [`FileSystem`]. A plain string is
+/// Contents of one file in a nulled [`Sysfs`]. A plain string is
 /// returned on every read; an array is returned one element per read.
 #[cfg(test)]
 pub struct NulledFile(ConfigurableResponses<Result<String, io::ErrorKind>>);
@@ -137,16 +175,16 @@ mod stub {
             let Some(responses) = files.get_mut(path) else {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("Nulled FileSystem: {} is not configured", path.display()),
+                    format!("Nulled Sysfs: {} is not configured", path.display()),
                 ));
             };
             responses
-                .next(&format!("Nulled FileSystem {}", path.display()))
+                .next(&format!("Nulled Sysfs {}", path.display()))
                 .map_err(|kind| {
                     io::Error::new(
                         kind,
                         format!(
-                            "Nulled FileSystem: configured failure reading {}",
+                            "Nulled Sysfs: configured failure reading {}",
                             path.display()
                         ),
                     )
@@ -169,7 +207,7 @@ mod stub {
             if entries.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("Nulled FileSystem: no directory {}", path.display()),
+                    format!("Nulled Sysfs: no directory {}", path.display()),
                 ));
             }
             Ok(entries.into_iter().collect())
@@ -179,10 +217,17 @@ mod stub {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, io::ErrorKind, path::Path};
+    use std::{collections::BTreeSet, io::ErrorKind, num::NonZeroU32, path::Path};
 
-    use super::{FileSystem, NulledFile};
-    use crate::nullable::ConfigurableResponses;
+    use super::{NulledFile, Sysfs};
+    use crate::{error::Error, nullable::ConfigurableResponses};
+
+    fn read_error_kind(err: &Error) -> Option<ErrorKind> {
+        match err {
+            Error::Read { source, .. } => Some(source.kind()),
+            _ => None,
+        }
+    }
 
     // Narrow integration tests: these run against a real temporary directory
     // and document the std::fs behaviour the stub must match.
@@ -190,22 +235,31 @@ mod tests {
         use super::*;
 
         #[test]
-        fn returns_contents_verbatim_including_trailing_newline() {
+        fn reads_an_attribute_ignoring_the_trailing_newline() {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("brightness"), "290\n").unwrap();
-            let contents = FileSystem::create()
-                .read_to_string(&dir.path().join("brightness"))
+            let raw: u32 = Sysfs::create()
+                .read(&dir.path().join("brightness"), "a whole number")
                 .unwrap();
-            assert_eq!(contents, "290\n");
+            assert_eq!(raw, 290);
         }
 
         #[test]
-        fn missing_file_is_not_found() {
+        fn missing_file_is_a_read_error_naming_it() {
             let dir = tempfile::tempdir().unwrap();
-            let err = FileSystem::create()
-                .read_to_string(&dir.path().join("absent"))
+            let path = dir.path().join("absent");
+            let err = Sysfs::create()
+                .read::<u32>(&path, "a whole number")
                 .unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::NotFound);
+            assert_eq!(read_error_kind(&err), Some(ErrorKind::NotFound), "{err:?}");
+            assert!(matches!(&err, Error::Read { path: p, .. } if *p == path));
+        }
+
+        #[test]
+        fn missing_class_directory_has_no_devices() {
+            let dir = tempfile::tempdir().unwrap();
+            let devices = Sysfs::create().devices(&dir.path().join("absent")).unwrap();
+            assert_eq!(devices, Vec::<std::path::PathBuf>::new());
         }
 
         #[test]
@@ -214,7 +268,7 @@ mod tests {
             std::fs::create_dir(dir.path().join("iio:device7")).unwrap();
             std::fs::write(dir.path().join("iio:device7/name"), "als\n").unwrap();
             std::fs::write(dir.path().join("trigger0"), "").unwrap();
-            let entries: BTreeSet<_> = FileSystem::create()
+            let entries: BTreeSet<_> = Sysfs::create()
                 .read_dir(dir.path())
                 .unwrap()
                 .into_iter()
@@ -227,7 +281,7 @@ mod tests {
         #[test]
         fn missing_directory_is_not_found() {
             let dir = tempfile::tempdir().unwrap();
-            let err = FileSystem::create()
+            let err = Sysfs::create()
                 .read_dir(&dir.path().join("absent"))
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -239,30 +293,64 @@ mod tests {
 
         #[test]
         fn unconfigured_paths_are_not_found_like_the_real_filesystem() {
-            let fs = FileSystem::create_null_with([("/sys/a", NulledFile::from("1"))]);
-            let err = fs.read_to_string(Path::new("/sys/b")).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::NotFound);
+            let fs = Sysfs::create_null_with([("/sys/a", NulledFile::from("1"))]);
+            let err = fs
+                .read::<u32>(Path::new("/sys/b"), "a whole number")
+                .unwrap_err();
+            assert_eq!(read_error_kind(&err), Some(ErrorKind::NotFound), "{err:?}");
             let err = fs.read_dir(Path::new("/proc")).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NotFound);
         }
 
         #[test]
-        fn configured_failures_surface_with_their_kind() {
-            let fs = FileSystem::create_null_with([(
+        fn configured_failures_surface_as_read_errors_with_their_kind() {
+            let fs = Sysfs::create_null_with([(
                 "/sys/a",
                 NulledFile::from(ConfigurableResponses::from([
                     Ok("1".to_owned()),
                     Err(ErrorKind::TimedOut),
                 ])),
             )]);
-            assert_eq!(fs.read_to_string(Path::new("/sys/a")).unwrap(), "1");
-            let err = fs.read_to_string(Path::new("/sys/a")).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::TimedOut);
+            assert_eq!(fs.read::<u32>(Path::new("/sys/a"), "1").unwrap(), 1);
+            let err = fs.read::<u32>(Path::new("/sys/a"), "1").unwrap_err();
+            assert_eq!(read_error_kind(&err), Some(ErrorKind::TimedOut), "{err:?}");
+        }
+
+        #[test]
+        fn unparsable_contents_are_a_parse_error_quoting_the_real_file() {
+            let fs = Sysfs::create_null_with([("/sys/max_brightness", NulledFile::from("0\n"))]);
+            let err = fs
+                .read::<NonZeroU32>(Path::new("/sys/max_brightness"), "a positive whole number")
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Parse { path, contents, expected: "a positive whole number" }
+                    if path == Path::new("/sys/max_brightness") && contents == "0\n"),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn devices_are_in_name_order_and_a_missing_class_is_empty() {
+            let fs = Sysfs::create_null_with([
+                ("/sys/class/backlight/zeta/type", NulledFile::from("raw\n")),
+                ("/sys/class/backlight/alpha/type", NulledFile::from("raw\n")),
+            ]);
+            assert_eq!(
+                fs.devices(Path::new("/sys/class/backlight")).unwrap(),
+                [
+                    Path::new("/sys/class/backlight/alpha"),
+                    Path::new("/sys/class/backlight/zeta"),
+                ]
+            );
+            assert_eq!(
+                fs.devices(Path::new("/sys/bus/iio/devices")).unwrap(),
+                Vec::<std::path::PathBuf>::new()
+            );
         }
 
         #[test]
         fn read_dir_lists_files_and_intermediate_directories() {
-            let fs = FileSystem::create_null_with([
+            let fs = Sysfs::create_null_with([
                 (
                     "/sys/bus/iio/devices/iio:device7/name",
                     NulledFile::from("als"),

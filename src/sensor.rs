@@ -1,16 +1,13 @@
 //! The ambient light sensor, found through the kernel's IIO subsystem.
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use crate::{
     error::{Error, Result},
-    filesystem::FileSystem,
+    sysfs::Sysfs,
 };
 #[cfg(test)]
-use crate::{filesystem::NulledFile, nullable::ConfigurableResponses};
+use crate::{nullable::ConfigurableResponses, sysfs::NulledFile};
 
 const IIO_DEVICES: &str = "/sys/bus/iio/devices";
 
@@ -24,7 +21,7 @@ const CHANNELS: [&str; 2] = ["in_illuminance_", "in_illuminance0_"];
 const NULLED_SCALE: f64 = 0.001;
 
 pub struct Sensor {
-    fs: FileSystem,
+    fs: Sysfs,
     device: PathBuf,
     reading: Reading,
 }
@@ -57,23 +54,12 @@ impl Sensor {
     /// [`Error::NoSensor`] when no device has one; [`Error::Read`] or
     /// [`Error::Parse`] when the chosen device's scale or offset is unusable.
     pub fn detect() -> Result<Self> {
-        Self::detect_in(FileSystem::create())
+        Self::detect_in(Sysfs::create())
     }
 
-    fn detect_in(fs: FileSystem) -> Result<Self> {
+    fn detect_in(fs: Sysfs) -> Result<Self> {
         let root = Path::new(IIO_DEVICES);
-        let mut devices = match fs.read_dir(root) {
-            Ok(devices) => devices,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(source) => {
-                return Err(Error::Read {
-                    path: root.to_owned(),
-                    source,
-                });
-            }
-        };
-        devices.sort();
-        for device in devices {
+        for device in fs.devices(root)? {
             // Triggers and anything that vanishes mid-scan are not sensors.
             let Ok(attributes) = fs.read_dir(&device) else {
                 continue;
@@ -93,7 +79,7 @@ impl Sensor {
                 if let Some(path) = attribute(prefix, "raw") {
                     let constant = |suffix, default| {
                         attribute(prefix, suffix)
-                            .map_or(Ok(default), |path| read_number(&fs, &path))
+                            .map_or(Ok(default), |path| fs.read(&path, "a number"))
                     };
                     let reading = Reading::Raw {
                         path,
@@ -125,12 +111,12 @@ impl Sensor {
     /// [`Error::Read`] or [`Error::Parse`] when the channel is unreadable.
     pub fn lux(&self) -> Result<f64> {
         match &self.reading {
-            Reading::Processed(path) => read_number(&self.fs, path),
+            Reading::Processed(path) => self.fs.read(path, "a number"),
             Reading::Raw {
                 path,
                 offset,
                 scale,
-            } => Ok((read_number(&self.fs, path)? + offset) * scale),
+            } => Ok((self.fs.read::<f64>(path, "a number")? + offset) * scale),
         }
     }
 }
@@ -153,9 +139,9 @@ impl Sensor {
         let dir = format!("{IIO_DEVICES}/iio:device0");
         let raw = readings.into().map(|reading| match reading {
             NulledReading::Lux(lux) => Ok(format!("{}\n", (lux / NULLED_SCALE).round())),
-            NulledReading::Unreadable => Err(io::ErrorKind::Other),
+            NulledReading::Unreadable => Err(std::io::ErrorKind::Other),
         });
-        let fs = FileSystem::create_null_with([
+        let fs = Sysfs::create_null_with([
             (format!("{dir}/name"), NulledFile::from("als\n")),
             (format!("{dir}/in_illuminance_raw"), NulledFile::from(raw)),
             (
@@ -171,18 +157,6 @@ impl Sensor {
     }
 }
 
-fn read_number(fs: &FileSystem, path: &Path) -> Result<f64> {
-    let contents = fs.read_to_string(path).map_err(|source| Error::Read {
-        path: path.to_owned(),
-        source,
-    })?;
-    contents.trim().parse().map_err(|_| Error::Parse {
-        path: path.to_owned(),
-        contents,
-        expected: "a number",
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -192,13 +166,13 @@ mod tests {
     use super::{NulledReading, Sensor};
     use crate::{
         error::Error,
-        filesystem::{FileSystem, NulledFile},
+        sysfs::{NulledFile, Sysfs},
     };
 
     const ALS: &str = "/sys/bus/iio/devices/iio:device7";
 
     fn detect(files: &[(&str, &str)]) -> crate::error::Result<Sensor> {
-        Sensor::detect_in(FileSystem::create_null_with(
+        Sensor::detect_in(Sysfs::create_null_with(
             files
                 .iter()
                 .map(|(path, contents)| (*path, NulledFile::from(*contents))),
@@ -284,24 +258,6 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, Error::NoSensor { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn garbage_is_a_parse_error_naming_the_file_and_contents() {
-        let sensor = detect(&[(
-            "/sys/bus/iio/devices/iio:device7/in_illuminance_raw",
-            "\u{0}bogus\n",
-        )])
-        .unwrap();
-        let err = sensor.lux().unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                Error::Parse { path, contents, .. }
-                    if path == Path::new(ALS).join("in_illuminance_raw").as_path() && contents == "\u{0}bogus\n"
-            ),
-            "{err:?}"
-        );
     }
 
     #[test]
