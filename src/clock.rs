@@ -1,7 +1,7 @@
 //! Time. [`Clock::create`] reads the monotonic clock and really sleeps. The
-//! nulled clock keeps a virtual time that only sleeping and
-//! [`Clock::advance`] move, so tests run hours of control loop in
-//! microseconds and assert on the pacing through the sleeps they track.
+//! nulled clock keeps a virtual time that only sleeping moves, so tests run
+//! hours of control loop in microseconds and assert on the pacing through
+//! the sleeps they track.
 
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
@@ -57,14 +57,6 @@ impl Clock {
     #[must_use]
     pub fn track_sleeps(&self) -> OutputTracker<Duration> {
         self.sleeps.track()
-    }
-
-    /// Lets time pass outside any sleep, as slow I/O does.
-    pub fn advance(&self, by: Duration) {
-        match &self.time {
-            Time::Real => panic!("only a nulled clock can be advanced"),
-            Time::Stubbed(now) => *now.lock().unwrap() += by,
-        }
     }
 }
 
@@ -136,10 +128,10 @@ mod tests {
         let clock = Clock::create_null();
         let sleeps = clock.track_sleeps();
         let start = clock.now();
-        clock.advance(Duration::from_secs(5));
+        clock.sleep_until(start + Duration::from_secs(5));
         clock.sleep_until(start + Duration::from_secs(2));
         assert_eq!(clock.now() - start, Duration::from_secs(5));
-        assert_eq!(sleeps.data(), [Duration::ZERO]);
+        assert_eq!(sleeps.data(), [Duration::from_secs(5), Duration::ZERO]);
     }
 
     #[test]
@@ -155,7 +147,7 @@ mod tests {
         let clock = Clock::create_null();
         let other = clock.clone();
         let start = clock.now();
-        other.advance(Duration::from_millis(2));
+        other.sleep_until(start + Duration::from_millis(2));
         assert_eq!(clock.now() - start, Duration::from_millis(2));
     }
 }
