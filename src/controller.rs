@@ -1,7 +1,7 @@
 //! The control loop: sample the light every [`SAMPLE_INTERVAL`], and while
 //! the panel needs to move, update it every [`FRAME`].
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -26,7 +26,8 @@ pub const SETTLED_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// changing light closely instead of in once-a-second jumps.
 pub const FADING_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long the sensor may stay unreadable before autolux exits.
+/// How long the sensor may stay unreadable before autolux exits. This is
+/// measured time, which does not count suspend.
 ///
 /// Ten seconds rides out a sensor hub resuming from suspend. Beyond that the
 /// device has probably been renumbered, and a restart re-detects it.
@@ -39,11 +40,15 @@ pub struct Controller {
     smoother: Smoother,
     /// Most recent good reading, for logs.
     lux: f64,
-    until_sample: Duration,
-    /// How long the previous step slept; the next advance covers it.
-    slept: Duration,
-    /// Time since the sensor last read successfully.
-    since_good_read: Duration,
+    next_sample: Instant,
+    /// The next frame deadline while fading. Frames sit on a grid anchored
+    /// at the wake, so time spent writing shortens the next sleep instead
+    /// of adding to it.
+    next_frame: Instant,
+    /// When the smoother last advanced.
+    advanced: Instant,
+    /// When the sensor last read successfully.
+    good_read: Instant,
 }
 
 impl Controller {
@@ -68,6 +73,7 @@ impl Controller {
             "starting at {lux:.1} lux, {}%",
             curve.percent(brightness),
         );
+        let now = clock.now();
         Ok(Self {
             sensor,
             backlight,
@@ -75,69 +81,77 @@ impl Controller {
             smoother: Smoother::new(curve, brightness, lux),
             lux,
             // The first step reacts to the startup reading before sampling again.
-            until_sample: SETTLED_SAMPLE_INTERVAL,
-            slept: Duration::ZERO,
-            since_good_read: Duration::ZERO,
+            next_sample: now + SETTLED_SAMPLE_INTERVAL,
+            next_frame: now,
+            advanced: now,
+            good_read: now,
         })
     }
 
-    /// One pass of the loop: sample if due, act, then sleep until there is
-    /// something to do.
+    /// One pass of the loop: sample if due, advance the panel if it is
+    /// settled or a frame is due, then sleep until the next deadline.
     ///
     /// # Errors
     /// A write the panel refused, an unreadable panel, or a sensor that has
     /// been unreadable for [`MAX_SENSOR_OUTAGE`].
     pub fn step(&mut self) -> Result<()> {
-        if self.until_sample.is_zero() {
-            self.sample()?;
-            self.until_sample = if self.smoother.is_fading() {
+        let now = self.clock.now();
+        if now >= self.next_sample {
+            self.sample(now)?;
+            let interval = if self.smoother.is_fading() {
                 FADING_SAMPLE_INTERVAL
             } else {
                 SETTLED_SAMPLE_INTERVAL
             };
+            self.next_sample = next_deadline(self.next_sample, interval, now);
         }
-        let pause = match self.smoother.advance(self.slept) {
-            Step::Settled => self.until_sample,
-            Step::Wake { target } => {
-                let brightness = self.backlight.brightness()?;
-                let curve = self.smoother.curve();
-                info!(
-                    "{:.1} lux: fading from {}% to {}%",
-                    self.lux,
-                    curve.percent(brightness),
-                    curve.percent(target),
-                );
-                self.smoother.resync(brightness);
-                self.until_sample = self.until_sample.min(FADING_SAMPLE_INTERVAL);
-                FRAME
-            }
-            Step::Fade(write) => {
-                if let Some(raw) = write {
-                    debug!(raw, "set");
-                    self.backlight.set(raw)?;
+        if !self.smoother.is_fading() || now >= self.next_frame {
+            let elapsed = now.saturating_duration_since(self.advanced);
+            self.advanced = now;
+            match self.smoother.advance(elapsed) {
+                Step::Settled => {}
+                Step::Wake { target } => {
+                    let brightness = self.backlight.brightness()?;
+                    let curve = self.smoother.curve();
+                    info!(
+                        "{:.1} lux: fading from {}% to {}%",
+                        self.lux,
+                        curve.percent(brightness),
+                        curve.percent(target),
+                    );
+                    self.smoother.resync(brightness);
+                    self.next_frame = now + FRAME;
+                    self.next_sample = self.next_sample.min(now + FADING_SAMPLE_INTERVAL);
                 }
-                FRAME
+                Step::Fade(write) => {
+                    if let Some(raw) = write {
+                        debug!(raw, "set");
+                        self.backlight.set(raw)?;
+                    }
+                    self.next_frame = next_deadline(self.next_frame, FRAME, now);
+                }
             }
         }
-        .min(self.until_sample);
-        self.clock.sleep(pause);
-        self.until_sample -= pause;
-        self.slept = pause;
-        self.since_good_read += pause;
+        let deadline = if self.smoother.is_fading() {
+            self.next_frame.min(self.next_sample)
+        } else {
+            self.next_sample
+        };
+        self.clock.sleep_until(deadline);
         Ok(())
     }
 
-    fn sample(&mut self) -> Result<()> {
+    fn sample(&mut self, now: Instant) -> Result<()> {
         match self.sensor.lux() {
             Ok(lux) => {
-                self.since_good_read = Duration::ZERO;
+                self.good_read = now;
                 self.lux = lux;
                 self.smoother.observe(lux);
                 Ok(())
             }
-            Err(err) if self.since_good_read >= MAX_SENSOR_OUTAGE => {
+            Err(err) if now - self.good_read >= MAX_SENSOR_OUTAGE => {
                 Err(Error::SensorUnavailable {
-                    outage: self.since_good_read,
+                    outage: now - self.good_read,
                     source: Box::new(err),
                 })
             }
@@ -147,6 +161,14 @@ impl Controller {
             }
         }
     }
+}
+
+/// The deadline one `interval` after `deadline`. If that has passed too,
+/// as after a stall, the missed deadlines are skipped and the next one is
+/// one `interval` after `now`.
+fn next_deadline(deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    let next = deadline + interval;
+    if next > now { next } else { now + interval }
 }
 
 /// `err` and its causes, joined, for one-line logs.
@@ -159,7 +181,7 @@ fn chain(err: &dyn std::error::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{Controller, FRAME, MAX_SENSOR_OUTAGE, SETTLED_SAMPLE_INTERVAL};
     use crate::{
@@ -203,6 +225,8 @@ mod tests {
         controller: Controller,
         writes: OutputTracker<u32>,
         sleeps: OutputTracker<Duration>,
+        /// Shares the controller's virtual time.
+        clock: Clock,
     }
 
     fn start(setup: Setup) -> crate::error::Result<Harness> {
@@ -215,12 +239,67 @@ mod tests {
         let writes = backlight.track_writes();
         let clock = Clock::create_null();
         let sleeps = clock.track_sleeps();
-        let controller = Controller::start(sensor, backlight, clock, Limits::new(2, 75).unwrap())?;
+        let controller = Controller::start(
+            sensor,
+            backlight,
+            clock.clone(),
+            Limits::new(2, 75).unwrap(),
+        )?;
         Ok(Harness {
             controller,
             writes,
             sleeps,
+            clock,
         })
+    }
+
+    /// When each write of one full-range fade happened, if every step
+    /// spends `io` on I/O before it sleeps again.
+    fn fade_write_times(io: Duration) -> Vec<Instant> {
+        let mut harness = start(Setup {
+            lux: BRIGHT.into(),
+            brightness: MIN_RAW.into(),
+            ..Setup::default()
+        })
+        .unwrap();
+        let mut times = Vec::new();
+        // A full-range fade takes about five seconds, or 300 frames.
+        for _ in 0..1_000 {
+            harness.clock.advance(io);
+            let at = harness.clock.now();
+            harness.controller.step().unwrap();
+            let writes = harness.writes.clear();
+            if !writes.is_empty() {
+                times.push(at);
+            }
+            if writes.last() == Some(&MAX_RAW) {
+                return times;
+            }
+        }
+        panic!("fade did not finish");
+    }
+
+    #[test]
+    fn time_spent_in_io_does_not_lengthen_the_frame_interval() {
+        // About what one logind write costs on a Surface Go 3.
+        let io = Duration::from_millis(2);
+        let times = fade_write_times(io);
+        let mut intervals: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        intervals.sort();
+        assert_eq!(
+            intervals[intervals.len() / 2],
+            FRAME,
+            "median write interval"
+        );
+        let with_io = *times.last().unwrap() - times[0];
+        let without_io = {
+            let times = fade_write_times(Duration::ZERO);
+            *times.last().unwrap() - times[0]
+        };
+        assert!(
+            with_io.abs_diff(without_io) <= FRAME,
+            "fade took {with_io:?} with I/O, {without_io:?} without"
+        );
     }
 
     #[test]
@@ -248,8 +327,7 @@ mod tests {
         })
         .unwrap();
         let mut elapsed = Duration::ZERO;
-        // A whole settled interval of sleep only happens once the fade is over.
-        while harness.sleeps.data().last() != Some(&SETTLED_SAMPLE_INTERVAL) {
+        while harness.writes.data().last() != Some(&MAX_RAW) {
             for slept in harness.sleeps.clear() {
                 assert!(slept <= FRAME, "slept {slept:?} mid-fade");
                 elapsed += slept;
@@ -258,13 +336,14 @@ mod tests {
             harness.controller.step().unwrap();
         }
         let writes = harness.writes.clear();
-        assert_eq!(writes.last(), Some(&MAX_RAW));
         assert!(writes.windows(2).all(|w| w[0] < w[1]), "{writes:?}");
         assert!(
             writes.len() > 100,
             "should take many small steps, took {}",
             writes.len()
         );
+        // The next sample after landing picks the settled interval.
+        harness.controller.step().unwrap();
         let _ = harness.sleeps.clear();
         for _ in 0..3 {
             harness.controller.step().unwrap();
@@ -332,6 +411,40 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(harness.writes.data(), [], "should not write");
+    }
+
+    #[test]
+    fn the_outage_counts_measured_time_not_requested_sleeps() {
+        let mut harness = start(Setup {
+            lux: [
+                DARK,
+                NulledReading::Unreadable,
+                NulledReading::Unreadable,
+                NulledReading::Unreadable,
+            ]
+            .into(),
+            brightness: MIN_RAW.into(),
+            ..Setup::default()
+        })
+        .unwrap();
+        // Each step hangs for 4 s before it samples. The next sample is due
+        // 1 s after the previous one, so samples land 4 s, 9 s and 14 s after
+        // the startup reading, worked out by hand.
+        let hang = Duration::from_secs(4);
+        for sample in 1..=2 {
+            harness.clock.advance(hang);
+            harness
+                .controller
+                .step()
+                .unwrap_or_else(|e| panic!("sample {sample} failed early: {e:?}"));
+        }
+        harness.clock.advance(hang);
+        let err = harness.controller.step().unwrap_err();
+        assert!(
+            matches!(&err, Error::SensorUnavailable { outage, .. }
+                if *outage == Duration::from_secs(14)),
+            "{err:?}"
+        );
     }
 
     #[test]

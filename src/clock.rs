@@ -1,34 +1,48 @@
-//! Waiting. [`Clock::create`] really sleeps. The nulled clock returns at
-//! once, so tests run hours of control loop in microseconds and assert on
-//! the pacing through the sleeps they track.
+//! Time. [`Clock::create`] reads the monotonic clock and really sleeps. The
+//! nulled clock keeps a virtual time that only sleeping and
+//! [`Clock::advance`] move, so tests run hours of control loop in
+//! microseconds and assert on the pacing through the sleeps they track.
 
-use std::time::Duration;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::nullable::OutputListener;
 #[cfg(test)]
 use crate::nullable::OutputTracker;
 
+/// Clones share the time of a nulled clock and the sleep trackers.
+#[derive(Clone)]
 pub struct Clock {
-    sleeper: Sleeper,
+    time: Time,
     sleeps: OutputListener<Duration>,
 }
 
 impl Clock {
     #[must_use]
     pub fn create() -> Self {
-        Self::new(Sleeper::Real)
+        Self::new(Time::Real)
     }
 
-    fn new(sleeper: Sleeper) -> Self {
+    fn new(time: Time) -> Self {
         Self {
-            sleeper,
+            time,
             sleeps: OutputListener::default(),
         }
     }
 
-    pub fn sleep(&self, duration: Duration) {
-        self.sleeps.emit(|| duration);
-        self.sleeper.sleep(duration);
+    /// Monotonic time. It does not count time spent in suspend, because
+    /// [`Instant`] is `CLOCK_MONOTONIC` on Linux.
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        self.time.now()
+    }
+
+    /// Sleeps until `deadline`, or returns at once if it has passed.
+    pub fn sleep_until(&self, deadline: Instant) {
+        self.sleeps
+            .emit(|| deadline.saturating_duration_since(self.now()));
+        self.time.sleep_until(deadline);
     }
 }
 
@@ -36,28 +50,49 @@ impl Clock {
 impl Clock {
     #[must_use]
     pub fn create_null() -> Self {
-        Self::new(Sleeper::Stubbed)
+        Self::new(Time::Stubbed(Arc::new(Mutex::new(Instant::now()))))
     }
 
+    /// Tracks how long each sleep lasted.
     #[must_use]
     pub fn track_sleeps(&self) -> OutputTracker<Duration> {
         self.sleeps.track()
     }
+
+    /// Lets time pass outside any sleep, as slow I/O does.
+    pub fn advance(&self, by: Duration) {
+        match &self.time {
+            Time::Real => panic!("only a nulled clock can be advanced"),
+            Time::Stubbed(now) => *now.lock().unwrap() += by,
+        }
+    }
 }
 
-// The seam. The real arm only forwards to std::thread::sleep.
-enum Sleeper {
+// The seam. The real arm only forwards to std.
+#[derive(Clone)]
+enum Time {
     Real,
     #[cfg(test)]
-    Stubbed,
+    Stubbed(Arc<Mutex<Instant>>),
 }
 
-impl Sleeper {
-    fn sleep(&self, duration: Duration) {
+impl Time {
+    fn now(&self) -> Instant {
         match self {
-            Self::Real => std::thread::sleep(duration),
+            Self::Real => Instant::now(),
             #[cfg(test)]
-            Self::Stubbed => {}
+            Self::Stubbed(now) => *now.lock().unwrap(),
+        }
+    }
+
+    fn sleep_until(&self, deadline: Instant) {
+        match self {
+            Self::Real => std::thread::sleep(deadline.saturating_duration_since(Instant::now())),
+            #[cfg(test)]
+            Self::Stubbed(now) => {
+                let mut now = now.lock().unwrap();
+                *now = (*now).max(deadline);
+            }
         }
     }
 }
@@ -69,19 +104,58 @@ mod tests {
     use super::Clock;
 
     #[test]
-    fn real_clock_sleeps_at_least_as_long_as_asked() {
-        let start = Instant::now();
-        Clock::create().sleep(Duration::from_millis(20));
-        assert!(start.elapsed() >= Duration::from_millis(20));
+    fn real_clock_sleeps_until_the_deadline() {
+        let clock = Clock::create();
+        let deadline = clock.now() + Duration::from_millis(20);
+        clock.sleep_until(deadline);
+        assert!(Instant::now() >= deadline);
     }
 
     #[test]
-    fn nulled_clock_returns_at_once_and_records_the_request() {
+    fn real_clock_returns_at_once_for_a_past_deadline() {
+        let clock = Clock::create();
+        let start = clock.now();
+        clock.sleep_until(start.checked_sub(Duration::from_secs(1)).unwrap());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn nulled_clock_returns_at_once_and_sleeping_advances_its_time() {
         let clock = Clock::create_null();
         let sleeps = clock.track_sleeps();
+        let virtual_start = clock.now();
         let start = Instant::now();
-        clock.sleep(Duration::from_secs(3600));
+        clock.sleep_until(virtual_start + Duration::from_secs(3600));
         assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(clock.now() - virtual_start, Duration::from_secs(3600));
         assert_eq!(sleeps.data(), [Duration::from_secs(3600)]);
+    }
+
+    #[test]
+    fn nulled_clock_does_not_go_back_for_a_past_deadline() {
+        let clock = Clock::create_null();
+        let sleeps = clock.track_sleeps();
+        let start = clock.now();
+        clock.advance(Duration::from_secs(5));
+        clock.sleep_until(start + Duration::from_secs(2));
+        assert_eq!(clock.now() - start, Duration::from_secs(5));
+        assert_eq!(sleeps.data(), [Duration::ZERO]);
+    }
+
+    #[test]
+    fn nulled_clock_stands_still_until_time_passes() {
+        let clock = Clock::create_null();
+        let start = clock.now();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(clock.now(), start);
+    }
+
+    #[test]
+    fn clones_of_a_nulled_clock_share_its_time() {
+        let clock = Clock::create_null();
+        let other = clock.clone();
+        let start = clock.now();
+        other.advance(Duration::from_millis(2));
+        assert_eq!(clock.now() - start, Duration::from_millis(2));
     }
 }
