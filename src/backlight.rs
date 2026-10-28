@@ -8,9 +8,14 @@ use std::{
 
 use crate::{
     error::{Error, Result},
-    filesystem::{FileSystem, NulledFile},
+    filesystem::FileSystem,
     logind::Logind,
-    nullable::{OutputListener, OutputTracker, Responses},
+    nullable::OutputListener,
+};
+#[cfg(test)]
+use crate::{
+    filesystem::NulledFile,
+    nullable::{ConfigurableResponses, OutputTracker},
 };
 
 const BACKLIGHTS: &str = "/sys/class/backlight";
@@ -26,20 +31,22 @@ pub struct Backlight {
 
 /// The panel a nulled [`Backlight`] presents. The defaults are deliberately
 /// odd numbers, so a test that leans on one by accident stands out.
-#[derive(Debug, Clone)]
+#[cfg(test)]
+#[derive(Debug)]
 pub struct NulledBacklight {
     pub max_brightness: u32,
     /// What successive reads of `brightness` return.
-    pub brightness: Responses<u32>,
+    pub brightness: ConfigurableResponses<u32>,
     /// When set, logind refuses every write with this reason.
     pub refusal: Option<String>,
 }
 
+#[cfg(test)]
 impl Default for NulledBacklight {
     fn default() -> Self {
         Self {
             max_brightness: 4321,
-            brightness: Responses::Always(1234),
+            brightness: ConfigurableResponses::Repeat(1234),
             refusal: None,
         }
     }
@@ -108,10 +115,42 @@ impl Backlight {
             dir,
             name,
             max,
-            writes: OutputListener::new(),
+            writes: OutputListener::default(),
         })
     }
 
+    /// The device name, as logind and logs know it.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The panel's `max_brightness`, in raw driver units.
+    #[must_use]
+    pub fn max(&self) -> NonZeroU32 {
+        self.max
+    }
+
+    /// The panel's current raw brightness.
+    ///
+    /// # Errors
+    /// [`Error::Read`] or [`Error::Parse`].
+    pub fn brightness(&self) -> Result<u32> {
+        read_whole_number(&self.fs, &self.dir.join("brightness"))
+    }
+
+    /// Sets the panel to raw brightness `raw`.
+    ///
+    /// # Errors
+    /// [`Error::Logind`] when logind refuses.
+    pub fn set(&self, raw: u32) -> Result<()> {
+        self.writes.emit(|| raw);
+        self.logind.set_brightness("backlight", &self.name, raw)
+    }
+}
+
+#[cfg(test)]
+impl Backlight {
     #[must_use]
     pub fn create_null() -> Self {
         Self::create_null_with(NulledBacklight::default())
@@ -144,35 +183,6 @@ impl Backlight {
             Logind::create_null_refusing(&reason)
         });
         Self::detect_in(fs, logind).expect("the nulled layout has a backlight")
-    }
-
-    /// The device name, as logind and logs know it.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The panel's `max_brightness`, in raw driver units.
-    #[must_use]
-    pub fn max(&self) -> NonZeroU32 {
-        self.max
-    }
-
-    /// The panel's current raw brightness.
-    ///
-    /// # Errors
-    /// [`Error::Read`] or [`Error::Parse`].
-    pub fn brightness(&self) -> Result<u32> {
-        read_whole_number(&self.fs, &self.dir.join("brightness"))
-    }
-
-    /// Sets the panel to raw brightness `raw`.
-    ///
-    /// # Errors
-    /// [`Error::Logind`] when logind refuses.
-    pub fn set(&self, raw: u32) -> Result<()> {
-        self.writes.emit(&raw);
-        self.logind.set_brightness("backlight", &self.name, raw)
     }
 
     #[must_use]

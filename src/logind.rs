@@ -3,13 +3,15 @@
 //! sysfs brightness files are root-only, but logind's `SetBrightness` lets
 //! the owner of a seated session change them, so autolux can run as a plain
 //! user service without a udev rule. [`Logind::create`] talks to the real
-//! system bus; [`Logind::create_null`] accepts every request without I/O.
+//! system bus; the nulled logind accepts every request without I/O.
 
 use std::cell::RefCell;
 
+#[cfg(test)]
+use crate::nullable::OutputTracker;
 use crate::{
     error::{Error, Result},
-    nullable::{OutputListener, OutputTracker},
+    nullable::OutputListener,
 };
 
 /// One `SetBrightness` call, as sent.
@@ -21,7 +23,7 @@ pub struct BrightnessRequest {
 }
 
 pub struct Logind {
-    session: Box<dyn Session>,
+    session: Session,
     requests: OutputListener<BrightnessRequest>,
 }
 
@@ -30,30 +32,13 @@ impl Logind {
     /// first request.
     #[must_use]
     pub fn create() -> Self {
-        Self::new(Box::new(RealSession {
-            proxy: RefCell::new(None),
-        }))
+        Self::new(Session::Real(RefCell::new(None)))
     }
 
-    /// Accepts every request.
-    #[must_use]
-    pub fn create_null() -> Self {
-        Self::new(Box::new(StubbedSession { refusal: None }))
-    }
-
-    /// Refuses every request with `reason`, the way logind refuses callers
-    /// outside a seated session.
-    #[must_use]
-    pub fn create_null_refusing(reason: &str) -> Self {
-        Self::new(Box::new(StubbedSession {
-            refusal: Some(reason.to_owned()),
-        }))
-    }
-
-    fn new(session: Box<dyn Session>) -> Self {
+    fn new(session: Session) -> Self {
         Self {
             session,
-            requests: OutputListener::new(),
+            requests: OutputListener::default(),
         }
     }
 
@@ -75,7 +60,7 @@ impl Logind {
     /// # Errors
     /// [`Error::Logind`] when logind refuses or the bus fails.
     pub fn set_brightness(&self, subsystem: &str, name: &str, brightness: u32) -> Result<()> {
-        self.requests.emit(&BrightnessRequest {
+        self.requests.emit(|| BrightnessRequest {
             subsystem: subsystem.to_owned(),
             name: name.to_owned(),
             brightness,
@@ -84,6 +69,24 @@ impl Logind {
             .set_brightness(subsystem, name, brightness)
             .map_err(|reason| Error::Logind { reason })
     }
+}
+
+#[cfg(test)]
+impl Logind {
+    /// Accepts every request.
+    #[must_use]
+    pub fn create_null() -> Self {
+        Self::new(Session::Stubbed { refusal: None })
+    }
+
+    /// Refuses every request with `reason`, the way logind refuses callers
+    /// outside a seated session.
+    #[must_use]
+    pub fn create_null_refusing(reason: &str) -> Self {
+        Self::new(Session::Stubbed {
+            refusal: Some(reason.to_owned()),
+        })
+    }
 
     #[must_use]
     pub fn track_requests(&self) -> OutputTracker<BrightnessRequest> {
@@ -91,64 +94,63 @@ impl Logind {
     }
 }
 
-/// Mirrors the bus connection and the one `org.freedesktop.login1.Session`
-/// method autolux calls.
-trait Session {
-    fn connect(&self) -> Result<(), String>;
-    fn set_brightness(&self, subsystem: &str, name: &str, brightness: u32) -> Result<(), String>;
+// The seam. Each arm mirrors the bus connection and the one
+// `org.freedesktop.login1.Session` method autolux calls. The real arm holds
+// the proxy, built on first use.
+enum Session {
+    Real(RefCell<Option<zbus::blocking::Proxy<'static>>>),
+    #[cfg(test)]
+    Stubbed {
+        refusal: Option<String>,
+    },
 }
 
-struct RealSession {
-    proxy: RefCell<Option<zbus::blocking::Proxy<'static>>>,
-}
-
-impl Session for RealSession {
+impl Session {
     fn connect(&self) -> Result<(), String> {
-        if self.proxy.borrow().is_some() {
-            return Ok(());
+        match self {
+            Self::Real(proxy) => connect(proxy),
+            #[cfg(test)]
+            Self::Stubbed { .. } => Ok(()),
         }
-        let proxy = (|| {
-            let connection = zbus::blocking::Connection::system()?;
-            zbus::blocking::proxy::Builder::new(&connection)
-                .destination("org.freedesktop.login1")?
-                // `auto` is the caller's own session, or for a systemd user
-                // service (which runs outside any session) the user's
-                // graphical one.
-                .path("/org/freedesktop/login1/session/auto")?
-                .interface("org.freedesktop.login1.Session")?
-                // Caching would subscribe to PropertiesChanged and wake
-                // autolux for every idle-hint flip, for properties it never
-                // reads.
-                .cache_properties(zbus::proxy::CacheProperties::No)
-                .build()
-        })()
-        .map_err(|e: zbus::Error| e.to_string())?;
-        *self.proxy.borrow_mut() = Some(proxy);
-        Ok(())
     }
 
     fn set_brightness(&self, subsystem: &str, name: &str, brightness: u32) -> Result<(), String> {
-        self.connect()?;
-        let proxy = self.proxy.borrow();
-        let proxy = proxy.as_ref().ok_or("not connected to the system bus")?;
-        proxy
-            .call::<_, _, ()>("SetBrightness", &(subsystem, name, brightness))
-            .map_err(|e| e.to_string())
+        match self {
+            Self::Real(proxy) => {
+                connect(proxy)?;
+                let proxy = proxy.borrow();
+                let proxy = proxy.as_ref().ok_or("not connected to the system bus")?;
+                proxy
+                    .call::<_, _, ()>("SetBrightness", &(subsystem, name, brightness))
+                    .map_err(|e| e.to_string())
+            }
+            #[cfg(test)]
+            Self::Stubbed { refusal } => refusal.clone().map_or(Ok(()), Err),
+        }
     }
 }
 
-struct StubbedSession {
-    refusal: Option<String>,
-}
-
-impl Session for StubbedSession {
-    fn connect(&self) -> Result<(), String> {
-        Ok(())
+fn connect(slot: &RefCell<Option<zbus::blocking::Proxy<'static>>>) -> Result<(), String> {
+    if slot.borrow().is_some() {
+        return Ok(());
     }
-
-    fn set_brightness(&self, _: &str, _: &str, _: u32) -> Result<(), String> {
-        self.refusal.clone().map_or(Ok(()), Err)
-    }
+    let proxy = (|| {
+        let connection = zbus::blocking::Connection::system()?;
+        zbus::blocking::proxy::Builder::new(&connection)
+            .destination("org.freedesktop.login1")?
+            // `auto` is the caller's own session, or for a systemd user
+            // service (which runs outside any session) the user's graphical
+            // one.
+            .path("/org/freedesktop/login1/session/auto")?
+            .interface("org.freedesktop.login1.Session")?
+            // Caching would subscribe to PropertiesChanged and wake autolux
+            // for every idle-hint flip, for properties it never reads.
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+    })()
+    .map_err(|e: zbus::Error| e.to_string())?;
+    *slot.borrow_mut() = Some(proxy);
+    Ok(())
 }
 
 #[cfg(test)]

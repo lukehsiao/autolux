@@ -167,7 +167,7 @@ mod tests {
         clock::Clock,
         curve::Limits,
         error::Error,
-        nullable::{OutputTracker, Responses},
+        nullable::{ConfigurableResponses, OutputTracker},
         sensor::{NulledReading, Sensor},
     };
 
@@ -184,8 +184,8 @@ mod tests {
     const IRRELEVANT_BRIGHTNESS: u32 = 1234;
 
     struct Setup {
-        lux: Responses<NulledReading>,
-        brightness: Responses<u32>,
+        lux: ConfigurableResponses<NulledReading>,
+        brightness: ConfigurableResponses<u32>,
         refusal: Option<&'static str>,
     }
 
@@ -278,7 +278,7 @@ mod tests {
         let mut harness = start(Setup {
             // Dark at startup and for the first sample; then the lights come
             // on for the second.
-            lux: Responses::from([vec![DARK; 2], vec![BRIGHT; 30]].concat()),
+            lux: ConfigurableResponses::from([vec![DARK; 2], vec![BRIGHT; 30]].concat()),
             // Settled at the minimum, then someone turns it up by hand.
             brightness: [MIN_RAW, 3000].into(),
             ..Setup::default()

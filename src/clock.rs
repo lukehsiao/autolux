@@ -1,42 +1,64 @@
-//! Waiting. [`Clock::create`] really sleeps; [`Clock::create_null`] returns
-//! at once, so tests run hours of control loop in microseconds and assert on
-//! the pacing through [`Clock::track_sleeps`].
+//! Waiting. [`Clock::create`] really sleeps. The nulled clock returns at
+//! once, so tests run hours of control loop in microseconds and assert on
+//! the pacing through the sleeps they track.
 
 use std::time::Duration;
 
-use crate::nullable::{OutputListener, OutputTracker};
+use crate::nullable::OutputListener;
+#[cfg(test)]
+use crate::nullable::OutputTracker;
 
 pub struct Clock {
-    sleep: fn(Duration),
+    sleeper: Sleeper,
     sleeps: OutputListener<Duration>,
 }
 
 impl Clock {
     #[must_use]
     pub fn create() -> Self {
-        Self::new(std::thread::sleep)
+        Self::new(Sleeper::Real)
     }
 
-    #[must_use]
-    pub fn create_null() -> Self {
-        Self::new(|_| {})
-    }
-
-    fn new(sleep: fn(Duration)) -> Self {
+    fn new(sleeper: Sleeper) -> Self {
         Self {
-            sleep,
-            sleeps: OutputListener::new(),
+            sleeper,
+            sleeps: OutputListener::default(),
         }
     }
 
     pub fn sleep(&self, duration: Duration) {
-        self.sleeps.emit(&duration);
-        (self.sleep)(duration);
+        self.sleeps.emit(|| duration);
+        self.sleeper.sleep(duration);
+    }
+}
+
+#[cfg(test)]
+impl Clock {
+    #[must_use]
+    pub fn create_null() -> Self {
+        Self::new(Sleeper::Stubbed)
     }
 
     #[must_use]
     pub fn track_sleeps(&self) -> OutputTracker<Duration> {
         self.sleeps.track()
+    }
+}
+
+// The seam. The real arm only forwards to std::thread::sleep.
+enum Sleeper {
+    Real,
+    #[cfg(test)]
+    Stubbed,
+}
+
+impl Sleeper {
+    fn sleep(&self, duration: Duration) {
+        match self {
+            Self::Real => std::thread::sleep(duration),
+            #[cfg(test)]
+            Self::Stubbed => {}
+        }
     }
 }
 

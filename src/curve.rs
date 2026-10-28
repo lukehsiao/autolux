@@ -40,12 +40,6 @@ impl Light {
         Self(lux.max(DARK_LUX).min(BRIGHT_LUX).ln())
     }
 
-    /// Back to lux, for logs.
-    #[must_use]
-    pub fn lux(self) -> f64 {
-        self.0.exp()
-    }
-
     /// Moves `fraction` (clamped to 0..=1) of the way toward `target`.
     #[must_use]
     #[expect(

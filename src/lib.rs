@@ -1,14 +1,14 @@
 pub mod args;
-pub mod backlight;
-pub mod clock;
-pub mod controller;
-pub mod curve;
+mod backlight;
+mod clock;
+mod controller;
+mod curve;
 pub mod error;
-pub mod filesystem;
-pub mod logind;
-pub mod nullable;
-pub mod sensor;
-pub mod smoother;
+mod filesystem;
+mod logind;
+mod nullable;
+mod sensor;
+mod smoother;
 
 use crate::{
     args::Args, backlight::Backlight, clock::Clock, controller::Controller, curve::Limits,

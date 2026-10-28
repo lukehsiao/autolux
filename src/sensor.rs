@@ -7,9 +7,10 @@ use std::{
 
 use crate::{
     error::{Error, Result},
-    filesystem::{FileSystem, NulledFile},
-    nullable::Responses,
+    filesystem::FileSystem,
 };
+#[cfg(test)]
+use crate::{filesystem::NulledFile, nullable::ConfigurableResponses};
 
 const IIO_DEVICES: &str = "/sys/bus/iio/devices";
 
@@ -19,6 +20,7 @@ const CHANNELS: [&str; 2] = ["in_illuminance_", "in_illuminance0_"];
 
 /// The scale the nulled sensor reports raw counts at, the same as the HID
 /// sensor in a Surface Go 3.
+#[cfg(test)]
 const NULLED_SCALE: f64 = 0.001;
 
 pub struct Sensor {
@@ -40,6 +42,7 @@ enum Reading {
 }
 
 /// What one read of a nulled sensor returns.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NulledReading {
     Lux(f64),
@@ -110,39 +113,6 @@ impl Sensor {
         })
     }
 
-    /// A sensor in a room at a steady, oddly specific 1234.5 lux, so a test
-    /// that leans on it by accident stands out.
-    #[must_use]
-    pub fn create_null() -> Self {
-        Self::create_null_with(NulledReading::Lux(1234.5))
-    }
-
-    /// A sensor laid out like a Surface Go 3's (raw counts at a fixed scale)
-    /// that reports `readings`: one value repeats, an array is consumed.
-    ///
-    /// # Panics
-    /// Never: the layout always has an illuminance channel.
-    pub fn create_null_with(readings: impl Into<Responses<NulledReading>>) -> Self {
-        let dir = format!("{IIO_DEVICES}/iio:device0");
-        let raw = readings.into().map(|reading| match reading {
-            NulledReading::Lux(lux) => Ok(format!("{}\n", (lux / NULLED_SCALE).round())),
-            NulledReading::Unreadable => Err(io::ErrorKind::Other),
-        });
-        let fs = FileSystem::create_null_with([
-            (format!("{dir}/name"), NulledFile::from("als\n")),
-            (format!("{dir}/in_illuminance_raw"), NulledFile::from(raw)),
-            (
-                format!("{dir}/in_illuminance_scale"),
-                NulledFile::from("0.001000000\n"),
-            ),
-            (
-                format!("{dir}/in_illuminance_offset"),
-                NulledFile::from("0\n"),
-            ),
-        ]);
-        Self::detect_in(fs).expect("the nulled layout has an illuminance channel")
-    }
-
     /// The IIO device in use, for logs.
     #[must_use]
     pub fn device(&self) -> &Path {
@@ -162,6 +132,42 @@ impl Sensor {
                 scale,
             } => Ok((read_number(&self.fs, path)? + offset) * scale),
         }
+    }
+}
+
+#[cfg(test)]
+impl Sensor {
+    /// A sensor in a room at a steady, oddly specific 1234.5 lux, so a test
+    /// that leans on it by accident stands out.
+    #[must_use]
+    pub fn create_null() -> Self {
+        Self::create_null_with(NulledReading::Lux(1234.5))
+    }
+
+    /// A sensor laid out like a Surface Go 3's (raw counts at a fixed scale)
+    /// that reports `readings`: one value repeats, an array is consumed.
+    ///
+    /// # Panics
+    /// Never: the layout always has an illuminance channel.
+    pub fn create_null_with(readings: impl Into<ConfigurableResponses<NulledReading>>) -> Self {
+        let dir = format!("{IIO_DEVICES}/iio:device0");
+        let raw = readings.into().map(|reading| match reading {
+            NulledReading::Lux(lux) => Ok(format!("{}\n", (lux / NULLED_SCALE).round())),
+            NulledReading::Unreadable => Err(io::ErrorKind::Other),
+        });
+        let fs = FileSystem::create_null_with([
+            (format!("{dir}/name"), NulledFile::from("als\n")),
+            (format!("{dir}/in_illuminance_raw"), NulledFile::from(raw)),
+            (
+                format!("{dir}/in_illuminance_scale"),
+                NulledFile::from("0.001000000\n"),
+            ),
+            (
+                format!("{dir}/in_illuminance_offset"),
+                NulledFile::from("0\n"),
+            ),
+        ]);
+        Self::detect_in(fs).expect("the nulled layout has an illuminance channel")
     }
 }
 
