@@ -7,13 +7,13 @@
 
 use std::cell::RefCell;
 
+use zbus::{DBusError, fdo};
+
 use crate::error::{Error, Result};
 
 /// logind's reply when the caller's session has no seat, is not in the
 /// foreground, or does not own the device.
 const NOT_YOUR_DEVICE: &str = "org.freedesktop.login1.NotYourDevice";
-/// logind's reply when the caller does not own the session.
-const ACCESS_DENIED: &str = "org.freedesktop.DBus.Error.AccessDenied";
 
 pub struct Logind {
     bus: Bus,
@@ -106,31 +106,40 @@ pub struct NulledLogind {
 #[cfg(test)]
 pub fn method_error(name: &str, detail: &str) -> zbus::Error {
     let call = zbus::Message::method_call("/org/freedesktop/login1/session/auto", "SetBrightness")
-        .expect("the path and member are valid")
         .build(&())
-        .expect("an empty body is valid");
+        .expect("the path, member and empty body are valid");
     zbus::Message::error(&call.header(), name)
-        .expect("the error name is valid")
         .build(&detail)
-        .expect("a string body is valid")
+        .expect("the error name and string body are valid")
         .into()
 }
 
 // logind's own name for the error, or the bus failure behind it. Only the
 // D-Bus error name tells a refusal apart from other failures; the detail is
-// free text.
+// free text. zbus turns a reply whose name the D-Bus specification defines,
+// such as AccessDenied, into an `fdo::Error`, and leaves logind's own names
+// as a `MethodError`.
 fn classify(error: zbus::Error) -> Error {
     match error {
         zbus::Error::MethodError(name, detail, _) => {
             let detail = detail.unwrap_or_default();
-            match name.as_str() {
-                NOT_YOUR_DEVICE | ACCESS_DENIED => Error::NotPermitted { detail },
-                _ => Error::Logind {
+            if name.as_str() == NOT_YOUR_DEVICE {
+                Error::NotPermitted { detail }
+            } else {
+                Error::Logind {
                     name: name.to_string(),
                     detail,
-                },
+                }
             }
         }
+        zbus::Error::FDO(error) => match *error {
+            // logind's reply when the caller does not own the session.
+            fdo::Error::AccessDenied(detail) => Error::NotPermitted { detail },
+            error => Error::Logind {
+                name: error.name().to_string(),
+                detail: error.description().unwrap_or_default().to_owned(),
+            },
+        },
         source @ (zbus::Error::Connection(..)
         | zbus::Error::InputOutput(_)
         | zbus::Error::Handshake(_)) => Error::Bus { source },
@@ -152,7 +161,7 @@ enum Bus {
 }
 
 enum Session {
-    Real(zbus::blocking::Proxy<'static>),
+    Real(zbus::Proxy<'static>),
     #[cfg(test)]
     Stubbed(Box<NulledLogind>),
 }
@@ -173,9 +182,9 @@ impl Bus {
 impl Session {
     fn set_brightness(&self, name: &str, brightness: u32) -> zbus::Result<()> {
         match self {
-            Self::Real(proxy) => {
-                proxy.call::<_, _, ()>("SetBrightness", &("backlight", name, brightness))
-            }
+            Self::Real(proxy) => zbus::block_on(
+                proxy.call::<_, _, ()>("SetBrightness", &("backlight", name, brightness)),
+            ),
             #[cfg(test)]
             Self::Stubbed(nulled) => match (&nulled.reply, &nulled.panels) {
                 (Some(reply), _) => Err(reply.clone()),
@@ -191,19 +200,25 @@ impl Session {
     }
 }
 
-fn connect() -> zbus::Result<zbus::blocking::Proxy<'static>> {
-    let connection = zbus::blocking::Connection::system()?;
-    zbus::blocking::proxy::Builder::new(&connection)
-        .destination("org.freedesktop.login1")?
-        // `auto` is the caller's own session, or for a systemd user
-        // service (which runs outside any session) the user's graphical
-        // one.
-        .path("/org/freedesktop/login1/session/auto")?
-        .interface("org.freedesktop.login1.Session")?
-        // Caching would subscribe to PropertiesChanged and wake autolux
-        // for every idle-hint flip, for properties it never reads.
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .build()
+// autolux is synchronous, so each exchange with the bus runs to completion
+// in its own `block_on`. Between calls, zbus drives the connection on a
+// helper thread of its own.
+fn connect() -> zbus::Result<zbus::Proxy<'static>> {
+    zbus::block_on(async {
+        let connection = zbus::Connection::system().await?;
+        zbus::proxy::Builder::new(&connection)
+            .destination("org.freedesktop.login1")
+            // `auto` is the caller's own session, or for a systemd user
+            // service (which runs outside any session) the user's graphical
+            // one.
+            .path("/org/freedesktop/login1/session/auto")
+            .interface("org.freedesktop.login1.Session")
+            // Caching would subscribe to PropertiesChanged and wake autolux
+            // for every idle-hint flip, for properties it never reads.
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+    })
 }
 
 #[cfg(test)]
@@ -269,8 +284,10 @@ mod tests {
     #[test]
     fn an_unreachable_bus_fails_at_connect() {
         let address = "unix:path=/run/dbus/system_bus_socket".parse().unwrap();
-        let unreachable =
-            zbus::Error::Connection(Arc::new(io::Error::from(io::ErrorKind::NotFound)), address);
+        let unreachable = zbus::Error::Connection(
+            Arc::new(io::Error::from(io::ErrorKind::NotFound)),
+            Box::new(address),
+        );
         let logind = Logind::create_null_with(NulledLogind {
             connect: Some(unreachable),
             ..NulledLogind::default()
@@ -307,20 +324,29 @@ mod tests {
         }
     }
 
+    // logind's own error names arrive as a MethodError, and the names the
+    // D-Bus specification defines arrive as an fdo::Error. Both keep them.
     #[test]
     fn other_logind_errors_keep_their_name_and_detail() {
-        let err = replying(method_error(
-            "System.Error.ENODEV",
-            "Failed to open device backlight:nope: No such device",
-        ))
-        .set_brightness("nope", 1)
-        .unwrap_err();
-        assert!(
-            matches!(&err, Error::Logind { name, detail }
-                if name == "System.Error.ENODEV"
-                    && detail == "Failed to open device backlight:nope: No such device"),
-            "{err:?}"
-        );
+        for (name, detail) in [
+            (
+                "System.Error.ENODEV",
+                "Failed to open device backlight:nope: No such device",
+            ),
+            (
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+                "The name org.freedesktop.login1 was not provided by any .service files",
+            ),
+        ] {
+            let err = replying(method_error(name, detail))
+                .set_brightness("nope", 1)
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Logind { name: shown, detail: said }
+                    if shown == name && said == detail),
+                "{name}: {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -28,10 +28,10 @@ thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-zbus = "5.19.0"
+zbus = { version = "6.1.0", default-features = false, features = ["default-rt", "proxy"] }
 
 [dev-dependencies]
-hegeltest = "0.48.1"
+hegeltest = "0.50.4"
 tempfile = "3.27.0"
 
 [package.metadata.binstall]

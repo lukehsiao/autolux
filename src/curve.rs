@@ -63,7 +63,6 @@ impl Light {
 /// The configured brightness range, as percentages of the panel's maximum.
 ///
 /// Invariant: `min <= max <= 100`.
-#[cfg_attr(test, derive(hegel::PrettyPrintable))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     min: u8,
@@ -87,7 +86,6 @@ impl Limits {
 /// Maps illuminance to a raw backlight value between two configured limits.
 ///
 /// Invariant: `min <= max <= panel_max`.
-#[cfg_attr(test, derive(hegel::PrettyPrintable))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Curve {
     min: u32,
